@@ -855,6 +855,23 @@ class VoiceReceiver:
 
         return completed
 
+    def drain_user_audio(self, user_id: int = 0) -> bytes:
+        """Pop all buffered PCM for *user_id* (0 = any mapped user).
+
+        Streaming counterpart of :meth:`check_silence` for the Realtime voice
+        mode, where turn detection happens server-side.  Audio from other
+        speakers is discarded so buffers never grow unbounded.
+        """
+        out = bytearray()
+        with self._lock:
+            for ssrc in list(self._buffers):
+                uid = self._ssrc_to_user.get(ssrc) or self._infer_user_for_ssrc(ssrc)
+                buf = self._buffers.pop(ssrc)
+                self._last_packet_time.pop(ssrc, None)
+                if uid and (not user_id or uid == user_id):
+                    out.extend(buf)
+        return bytes(out)
+
     # ------------------------------------------------------------------
     # PCM -> WAV conversion (for Whisper STT)
     # ------------------------------------------------------------------
@@ -1048,6 +1065,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        # Realtime voice mode (discord.voice_realtime): an OpenAI Realtime
+        # session talks with the user and delegates work back to the agent.
+        self._voice_realtime_bridges: Dict[int, Any] = {}  # guild_id -> RealtimeVoiceBridge
+        self._voice_delegate_callback: Optional[Callable] = None  # set by run.py
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -3896,6 +3917,30 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_voice_realtime_config(self) -> Dict[str, Any]:
+        """Read ``discord.voice_realtime`` from config.yaml (off by default).
+
+        The API key is a secret and lives in .env as
+        ``HERMES_REALTIME_OPENAI_API_KEY``, not here.
+        """
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "model": "gpt-realtime-2.1-mini",
+            "voice": "marin",
+            "instructions": "",  # "" = built-in default prompt
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            rt = ((cfg.get("discord") or {}).get("voice_realtime") or {})
+            if isinstance(rt, dict):
+                for k, v in rt.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_realtime config: %s", e)
+        return defaults
+
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
         try:
@@ -4152,16 +4197,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
+            except Exception as e:
+                receiver = None
+                logger.warning("Voice receiver failed to start: %s", e)
+
+            realtime = False
+            if receiver is not None and self._load_voice_realtime_config().get("enabled"):
+                try:
+                    realtime = await self._start_realtime_voice(guild_id, vc)
+                except Exception as e:
+                    logger.warning("Realtime voice failed to start, using STT/TTS: %s", e)
+            if receiver is not None and not realtime:
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
                     self._voice_listen_loop(guild_id)
                 )
-            except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
 
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy
             # one-shot FFmpegPCMAudio playback path in play_in_voice_channel.
-            if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
+            if not realtime and getattr(self, "_voice_fx_cfg", {}).get("enabled"):
                 try:
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:
@@ -4181,6 +4235,10 @@ class DiscordAdapter(BasePlatformAdapter):
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
                 listen_task.cancel()
+            bridge = getattr(self, "_voice_realtime_bridges", {}).pop(guild_id, None)
+            if bridge is not None:
+                pending_inputs = []  # Realtime mode streams audio; nothing to transcribe
+                await bridge.close()
 
             guild = self._client.get_guild(guild_id) if self._client is not None else None
             for user_id, pcm_data in pending_inputs:
@@ -4216,6 +4274,8 @@ class DiscordAdapter(BasePlatformAdapter):
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
+        if guild_id in getattr(self, "_voice_realtime_bridges", {}):
+            return False  # the Realtime session owns the outgoing audio stream
 
         # Playback is activity. Do not let the inactivity timer disconnect the
         # bot while duration probing, decoding, or speaking; re-arm it when this
@@ -4493,6 +4553,94 @@ class DiscordAdapter(BasePlatformAdapter):
             pass
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
+
+    async def _start_realtime_voice(self, guild_id: int, vc) -> bool:
+        """Open a Realtime session for this guild and route audio through it.
+
+        Returns False (caller falls back to STT/TTS) when the API key or the
+        runner's delegate callback is missing.
+        """
+        api_key = os.getenv("HERMES_REALTIME_OPENAI_API_KEY", "").strip()
+        if not api_key or not getattr(self, "_voice_delegate_callback", None):
+            logger.warning(
+                "discord.voice_realtime enabled but %s",
+                "HERMES_REALTIME_OPENAI_API_KEY is not set" if not api_key else "no delegate callback is wired",
+            )
+            return False
+        try:
+            from realtime_voice import RealtimeVoiceBridge
+        except ImportError:
+            from .realtime_voice import RealtimeVoiceBridge
+
+        delegate_cb = self._voice_delegate_callback
+
+        async def _delegate(task: str) -> str:
+            source = self._voice_sources.get(guild_id) or {}
+            return await delegate_cb(
+                guild_id=guild_id,
+                user_id=int(source.get("user_id") or 0),
+                task=task,
+            )
+
+        cfg = self._load_voice_realtime_config()
+        bridge = RealtimeVoiceBridge(
+            api_key=api_key,
+            delegate=_delegate,
+            model=str(cfg["model"]),
+            voice=str(cfg["voice"]),
+            instructions=str(cfg["instructions"]),
+        )
+        await bridge.start()
+        if vc.is_playing():
+            vc.stop()
+        vc.play(bridge.source)
+        self._voice_realtime_bridges[guild_id] = bridge
+        self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+            self._realtime_voice_loop(guild_id, bridge)
+        )
+        return True
+
+    async def _realtime_voice_loop(self, guild_id: int, bridge) -> None:
+        """Stream the invoking user's audio into the Realtime session.
+
+        Discord sends no packets while a user is silent, so gaps are filled
+        with silence to keep server-side turn detection working.
+        """
+        receiver = self._voice_receivers.get(guild_id)
+        if not receiver:
+            return
+        interval = 0.1
+        silence = b"\x00" * int(VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2 * interval)
+        try:
+            while receiver._running and bridge.running:
+                await asyncio.sleep(interval)
+                source = self._voice_sources.get(guild_id) or {}
+                pcm = receiver.drain_user_audio(int(source.get("user_id") or 0))
+                if pcm:
+                    self._reset_voice_timeout(guild_id)
+                await bridge.send_audio(pcm or silence)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error("Realtime voice loop error: %s", e, exc_info=True)
+        if guild_id in self._voice_realtime_bridges:
+            logger.warning("Realtime voice session closed; leaving voice channel (guild=%d)", guild_id)
+            text_ch_id = self._voice_text_channels.get(guild_id)
+            # Unregister this task first so leave_voice_channel doesn't cancel it mid-teardown.
+            self._voice_listen_tasks.pop(guild_id, None)
+            await self.leave_voice_channel(guild_id)
+            if self._on_voice_disconnect and text_ch_id:
+                try:
+                    self._on_voice_disconnect(str(text_ch_id))
+                except Exception:
+                    pass
+
+    def realtime_voice_active_for_chat(self, chat_id: str) -> bool:
+        """True when a Realtime voice session is bound to this text channel."""
+        return any(
+            str(self._voice_text_channels.get(gid)) == str(chat_id)
+            for gid in getattr(self, "_voice_realtime_bridges", {})
+        )
 
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""

@@ -11003,6 +11003,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # transcription is forwarded without requiring /voice join.
                     if hasattr(adapter, "_voice_input_callback"):
                         adapter._voice_input_callback = self._handle_voice_channel_input
+                    if hasattr(adapter, "_voice_delegate_callback"):
+                        adapter._voice_delegate_callback = self._handle_voice_realtime_delegate
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -12366,6 +12368,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
+                        if hasattr(adapter, "_voice_delegate_callback"):
+                            adapter._voice_delegate_callback = self._handle_voice_realtime_delegate
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -18742,6 +18746,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_voice_delegate_callback"):
+            adapter._voice_delegate_callback = self._handle_voice_realtime_delegate
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -18853,22 +18859,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
-    async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
-    ):
-        """Handle transcribed voice from a user in a voice channel.
-
-        Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
-        """
-        adapter = self.adapters.get(Platform.DISCORD)
-        if not adapter:
-            return
-
-        text_ch_id = adapter._voice_text_channels.get(guild_id)
-        if not text_ch_id:
-            return
-
+    def _build_voice_channel_event(
+        self, adapter, guild_id: int, user_id: int, text_ch_id: int,
+        text: str, message_type: MessageType,
+    ) -> MessageEvent:
+        """Build a synthetic MessageEvent for speech in a Discord voice channel."""
         # Build source — reuse the linked text channel's metadata when available
         # so voice input shares the same session as the bound text conversation.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
@@ -18885,8 +18880,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type="channel",
             )
 
+        # Use SimpleNamespace as raw_message so _get_guild_id() can extract
+        # guild_id and _send_voice_reply() plays audio in the voice channel.
+        from types import SimpleNamespace
+        # Resolve the bound text channel's channel_prompt so voice input gets
+        # the same per-channel context as typed messages (#50149).
+        channel_prompt: Optional[str] = None
+        resolver = getattr(adapter, "_resolve_channel_prompt", None)
+        if callable(resolver):
+            try:
+                resolved = resolver(str(text_ch_id))
+                channel_prompt = resolved if isinstance(resolved, str) else None
+            except Exception:
+                channel_prompt = None
+        return MessageEvent(
+            source=source,
+            text=text,
+            message_type=message_type,
+            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            channel_prompt=channel_prompt,
+        )
+
+    async def _handle_voice_channel_input(
+        self, guild_id: int, user_id: int, transcript: str
+    ):
+        """Handle transcribed voice from a user in a voice channel.
+
+        Creates a synthetic MessageEvent and processes it through the
+        adapter's full message pipeline (session, typing, agent, TTS reply).
+        """
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return
+
+        text_ch_id = adapter._voice_text_channels.get(guild_id)
+        if not text_ch_id:
+            return
+
+        event = self._build_voice_channel_event(
+            adapter, guild_id, user_id, text_ch_id, transcript, MessageType.VOICE
+        )
+
         # Check authorization before processing voice input
-        if not self._is_user_authorized(source):
+        if not self._is_user_authorized(event.source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
@@ -18908,29 +18944,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Build a synthetic MessageEvent and feed through the normal pipeline
-        # Use SimpleNamespace as raw_message so _get_guild_id() can extract
-        # guild_id and _send_voice_reply() plays audio in the voice channel.
-        from types import SimpleNamespace
-        # Resolve the bound text channel's channel_prompt so voice input gets
-        # the same per-channel context as typed messages (#50149).
-        channel_prompt: Optional[str] = None
-        resolver = getattr(adapter, "_resolve_channel_prompt", None)
-        if callable(resolver):
-            try:
-                resolved = resolver(str(text_ch_id))
-                channel_prompt = resolved if isinstance(resolved, str) else None
-            except Exception:
-                channel_prompt = None
-        event = MessageEvent(
-            source=source,
-            text=transcript,
-            message_type=MessageType.VOICE,
-            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
-            channel_prompt=channel_prompt,
-        )
-
         await adapter.handle_message(event)
+
+    async def _handle_voice_realtime_delegate(
+        self, guild_id: int, user_id: int, task: str
+    ) -> str:
+        """Run an ``ask_hermes`` call from the Realtime voice layer.
+
+        The task goes through the normal agent pipeline (same session as the
+        bound text channel) and the reply text is returned for the Realtime
+        model to speak.  Task and reply are mirrored to the text channel.
+        """
+        adapter = self.adapters.get(Platform.DISCORD)
+        text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
+        if not text_ch_id:
+            return "Hermes is not linked to a text channel for this voice session."
+
+        event = self._build_voice_channel_event(
+            adapter, guild_id, user_id, text_ch_id, task, MessageType.TEXT
+        )
+        if not self._is_user_authorized(event.source):
+            logger.debug("Unauthorized realtime voice delegation from user %d, ignoring", user_id)
+            return "This user is not authorized to use Hermes."
+
+        channel = adapter._client.get_channel(text_ch_id) if adapter._client else None
+        safe_task = task[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        try:
+            if channel:
+                await channel.send(f"**[Voice → Hermes]** <@{user_id}>: {safe_task}")
+        except Exception:
+            pass
+
+        response = await self._handle_message(event) or ""
+        if response:
+            try:
+                await adapter.send(str(text_ch_id), response)
+            except Exception:
+                logger.debug("Failed to mirror realtime delegation reply", exc_info=True)
+        return response
 
     def _should_send_voice_reply(
         self,
@@ -18954,6 +19005,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         chat_id = event.source.chat_id
+        # A Realtime voice session speaks for itself; never layer TTS over it.
+        _rt_adapter = self.adapters.get(event.source.platform)
+        if _rt_adapter is not None and getattr(_rt_adapter, "realtime_voice_active_for_chat", lambda _c: False)(chat_id) is True:
+            return False
         voice_key = self._voice_key(event.source.platform, chat_id)
         voice_mode = self._voice_mode.get(voice_key)
         is_voice_input = (event.message_type == MessageType.VOICE)
