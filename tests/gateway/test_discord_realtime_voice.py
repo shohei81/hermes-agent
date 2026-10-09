@@ -491,12 +491,16 @@ class TestRealtimeVoiceContext:
         adapter._voice_text_channels = {111: 123}
         adapter._client = MagicMock()
         adapter._client.get_channel = MagicMock(return_value=SimpleNamespace(name="agent-log"))
-        vc = SimpleNamespace(channel=SimpleNamespace(name="一般", guild=SimpleNamespace(name="Shohei81")))
+        vc = SimpleNamespace(channel=SimpleNamespace(name="一般", guild=SimpleNamespace(
+            name="Shohei81",
+            text_channels=[SimpleNamespace(name="digest", id=1), SimpleNamespace(name="diary", id=2)],
+        )))
 
         ctx = adapter._realtime_voice_context(111, vc)
 
         for expected in ("Your name is poi.", "USER PROFILE: Shohei", "MEMORY: notes",
-                         "'一般'", "'Shohei81'", "#agent-log", "Current time:"):
+                         "'一般'", "'Shohei81'", "#agent-log", "Current time:",
+                         "#digest (1)", "#diary (2)"):
             assert expected in ctx
 
 

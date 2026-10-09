@@ -18962,7 +18962,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         prompt = (
             "[Voice call] The user asked this by voice through your realtime voice "
-            "layer; your reply will be spoken back to them, so keep it concise.\n\n" + task
+            "layer; your reply will be spoken back to them, so keep it concise. "
+            "Act on it directly: read whatever Discord channels, files or web pages "
+            "you need without asking for confirmation (read-only actions need no "
+            "approval).\n\n" + task
         )
         event = self._build_voice_channel_event(
             adapter, guild_id, user_id, text_ch_id, prompt, MessageType.TEXT

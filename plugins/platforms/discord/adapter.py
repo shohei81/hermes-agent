@@ -4659,8 +4659,12 @@ class DiscordAdapter(BasePlatformAdapter):
             pass
         channel = getattr(vc, "channel", None)
         if channel is not None:
-            guild_name = getattr(getattr(channel, "guild", None), "name", "")
-            where.append(f"You are in the Discord voice channel '{channel.name}' on the server '{guild_name}'.")
+            guild = getattr(channel, "guild", None)
+            where.append(f"You are in the Discord voice channel '{channel.name}' on the server '{getattr(guild, 'name', '')}'.")
+            text_channels = [c for c in getattr(guild, "text_channels", []) or [] if getattr(c, "name", None)]
+            if text_channels:
+                listing = ", ".join(f"#{c.name} ({c.id})" for c in text_channels)
+                where.append(f"Text channels on this server that ask_hermes can read: {listing}.")
         text_ch_id = self._voice_text_channels.get(guild_id)
         text_ch = self._client.get_channel(text_ch_id) if (self._client and text_ch_id) else None
         if text_ch is not None and getattr(text_ch, "name", None):
