@@ -567,6 +567,25 @@ class VoiceReceiver:
         self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
 
+    def _sync_transport_keys(self) -> None:
+        """Pick up fresh keys after discord.py silently reconnects the voice socket.
+
+        Discord can force-disconnect a voice connection right after the
+        handshake; discord.py reconnects with a new ``secret_key`` while our
+        socket listener stays attached, so a key cached at :meth:`start`
+        would fail to decrypt every later packet.
+        """
+        conn = self._vc._connection
+        try:
+            key = bytes(conn.secret_key)
+        except Exception:
+            return
+        if key and key != self._secret_key:
+            self._secret_key = key
+            self._dave_session = conn.dave_session
+            self._bot_ssrc = conn.ssrc
+            logger.info("VoiceReceiver picked up refreshed voice keys (bot_ssrc=%d)", self._bot_ssrc)
+
     def stop(self):
         """Stop listening and clean up."""
         self._running = False
@@ -688,6 +707,8 @@ class VoiceReceiver:
 
         header = bytes(data[:header_size])
         payload_with_nonce = data[header_size:]
+
+        self._sync_transport_keys()
 
         # --- NaCl transport decrypt (aead_xchacha20_poly1305_rtpsize) ---
         if len(payload_with_nonce) < 4:

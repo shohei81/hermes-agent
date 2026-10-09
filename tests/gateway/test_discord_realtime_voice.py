@@ -429,3 +429,21 @@ class TestVoiceFollow:
         await adapter._follow_voice_state(self._member(), self._state(ch), self._state(ch))
         adapter.join_voice_channel.assert_not_called()
         adapter.leave_voice_channel.assert_not_called()
+
+
+class TestReceiverKeyRefresh:
+    def test_picks_up_secret_key_after_silent_reconnect(self):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        vc = MagicMock()
+        vc._connection.secret_key = [1] * 32
+        vc._connection.ssrc = 10
+        receiver = VoiceReceiver(vc)
+        receiver.start()
+        assert receiver._secret_key == bytes([1] * 32)
+
+        vc._connection.secret_key = [2] * 32  # discord.py reconnected
+        vc._connection.ssrc = 11
+        receiver._sync_transport_keys()
+
+        assert receiver._secret_key == bytes([2] * 32)
+        assert receiver._bot_ssrc == 11
