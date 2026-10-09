@@ -3952,7 +3952,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "enabled": False,
             "model": "gpt-realtime-2.1-mini",
             "voice": "marin",
-            "instructions": "",  # "" = built-in default prompt
+            "instructions": "",  # extra guidance (e.g. speaking style) appended to the built-in prompt
         }
         try:
             from hermes_cli.config import read_raw_config

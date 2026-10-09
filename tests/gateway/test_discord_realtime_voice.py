@@ -495,3 +495,25 @@ class TestRealtimeVoiceContext:
         for expected in ("Your name is poi.", "USER PROFILE: Shohei", "MEMORY: notes",
                          "'一般'", "'Shohei81'", "#agent-log", "Current time:"):
             assert expected in ctx
+
+
+class TestRealtimeExtraInstructions:
+    @pytest.mark.asyncio
+    async def test_configured_instructions_are_appended_not_replacing(self):
+        ws = FakeWS()
+
+        async def connect(url, api_key):
+            return ws
+
+        bridge = rv.RealtimeVoiceBridge(
+            api_key="k", delegate=AsyncMock(), instructions="Speak calmly.",
+            context="Your name is poi.", connect=connect,
+        )
+        await bridge.start()
+        try:
+            instructions = ws.sent[0]["session"]["instructions"]
+            assert instructions == "\n\n".join(
+                [rv.DEFAULT_INSTRUCTIONS, "Speak calmly.", "Your name is poi."]
+            )
+        finally:
+            await bridge.close()

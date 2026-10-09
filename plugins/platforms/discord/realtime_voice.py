@@ -161,7 +161,7 @@ class RealtimeVoiceBridge:
         self._model = model
         self._voice = voice
         self._instructions = "\n\n".join(
-            part for part in (instructions or DEFAULT_INSTRUCTIONS, context) if part
+            part for part in (DEFAULT_INSTRUCTIONS, instructions, context) if part
         )
         self._connect = connect
         self._ws: Any = None
