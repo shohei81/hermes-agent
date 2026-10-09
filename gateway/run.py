@@ -18960,8 +18960,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text_ch_id:
             return "Hermes is not linked to a text channel for this voice session."
 
+        prompt = (
+            "[Voice call] The user asked this by voice through your realtime voice "
+            "layer; your reply will be spoken back to them, so keep it concise.\n\n" + task
+        )
         event = self._build_voice_channel_event(
-            adapter, guild_id, user_id, text_ch_id, task, MessageType.TEXT
+            adapter, guild_id, user_id, text_ch_id, prompt, MessageType.TEXT
         )
         if not self._is_user_authorized(event.source):
             logger.debug("Unauthorized realtime voice delegation from user %d, ignoring", user_id)

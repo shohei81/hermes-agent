@@ -319,7 +319,8 @@ class TestRealtimeDelegate:
 
         assert reply == "予定は3件です"
         event = runner._handle_message.call_args[0][0]
-        assert event.text == "今日の予定は？"
+        assert event.text.startswith("[Voice call]")
+        assert event.text.endswith("今日の予定は？")
         assert event.message_type == MessageType.TEXT
         assert event.source.chat_id == "123"
         assert event.raw_message.guild_id == 111
@@ -447,3 +448,50 @@ class TestReceiverKeyRefresh:
 
         assert receiver._secret_key == bytes([2] * 32)
         assert receiver._bot_ssrc == 11
+
+
+class TestRealtimeVoiceContext:
+    @pytest.mark.asyncio
+    async def test_bridge_appends_context_to_instructions(self):
+        ws = FakeWS()
+
+        async def connect(url, api_key):
+            return ws
+
+        bridge = rv.RealtimeVoiceBridge(
+            api_key="k", delegate=AsyncMock(), context="Your name is poi.", connect=connect
+        )
+        await bridge.start()
+        try:
+            instructions = ws.sent[0]["session"]["instructions"]
+            assert instructions.startswith(rv.DEFAULT_INSTRUCTIONS)
+            assert instructions.endswith("Your name is poi.")
+        finally:
+            await bridge.close()
+
+    def test_adapter_context_has_soul_memory_and_location(self, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        import agent.prompt_builder as pb
+        import tools.memory_tool as mt
+
+        monkeypatch.setattr(pb, "load_soul_md", lambda: "Your name is poi.")
+
+        class FakeStore:
+            def load_from_disk(self):
+                pass
+
+            def format_for_system_prompt(self, target):
+                return {"user": "USER PROFILE: Shohei", "memory": "MEMORY: notes"}[target]
+
+        monkeypatch.setattr(mt, "MemoryStore", FakeStore)
+        adapter = object.__new__(DiscordAdapter)
+        adapter._voice_text_channels = {111: 123}
+        adapter._client = MagicMock()
+        adapter._client.get_channel = MagicMock(return_value=SimpleNamespace(name="agent-log"))
+        vc = SimpleNamespace(channel=SimpleNamespace(name="一般", guild=SimpleNamespace(name="Shohei81")))
+
+        ctx = adapter._realtime_voice_context(111, vc)
+
+        for expected in ("Your name is poi.", "USER PROFILE: Shohei", "MEMORY: notes",
+                         "'一般'", "'Shohei81'", "#agent-log", "Current time:"):
+            assert expected in ctx

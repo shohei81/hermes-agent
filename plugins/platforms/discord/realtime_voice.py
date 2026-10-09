@@ -42,12 +42,16 @@ BYTES_PER_MS = 192  # 48 kHz * 2 channels * 2 bytes / 1000
 MAX_TOOL_OUTPUT_CHARS = 4000
 
 DEFAULT_INSTRUCTIONS = (
-    "You are the voice of Hermes, the user's personal agent, talking in a "
-    "Discord voice channel. Reply in the user's language, briefly and "
-    "naturally, like a phone call. Handle small talk yourself. For anything "
-    "that needs tools, lookups, memory, files, scheduling or careful "
-    "reasoning, call ask_hermes with a self-contained task description. "
-    "Before calling it, say a short filler such as 'ちょっと調べるね'. When the "
+    "You are the live voice of the user's personal agent, talking with them in "
+    "a Discord voice channel. You ARE that agent: use the name, personality "
+    "and knowledge described below, and never say you are a separate voice "
+    "assistant. Reply in the user's language, briefly and naturally, like a "
+    "phone call. Handle small talk yourself. For anything that needs tools, "
+    "lookups, files, the web, calendars, other Discord channels, memory "
+    "updates or careful reasoning, call ask_hermes with a self-contained task "
+    "description: it runs your full agent with all of its tools and "
+    "permissions, so never claim you lack access before trying it. Before "
+    "calling it, say a short filler such as 'ちょっと調べるね'. When the "
     "result comes back, summarise it conversationally instead of reading it "
     "verbatim."
 )
@@ -149,13 +153,16 @@ class RealtimeVoiceBridge:
         model: str = "gpt-realtime-2.1-mini",
         voice: str = "marin",
         instructions: str = "",
+        context: str = "",
         connect: Callable[[str, str], Awaitable[Any]] = _default_connect,
     ) -> None:
         self._api_key = api_key
         self._delegate = delegate
         self._model = model
         self._voice = voice
-        self._instructions = instructions or DEFAULT_INSTRUCTIONS
+        self._instructions = "\n\n".join(
+            part for part in (instructions or DEFAULT_INSTRUCTIONS, context) if part
+        )
         self._connect = connect
         self._ws: Any = None
         self._recv_task: Optional[asyncio.Task] = None

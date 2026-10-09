@@ -4614,6 +4614,7 @@ class DiscordAdapter(BasePlatformAdapter):
             model=str(cfg["model"]),
             voice=str(cfg["voice"]),
             instructions=str(cfg["instructions"]),
+            context=self._realtime_voice_context(guild_id, vc),
         )
         await bridge.start()
         if vc.is_playing():
@@ -4624,6 +4625,49 @@ class DiscordAdapter(BasePlatformAdapter):
             self._realtime_voice_loop(guild_id, bridge)
         )
         return True
+
+    def _realtime_voice_context(self, guild_id: int, vc) -> str:
+        """Identity, memory and whereabouts for the Realtime voice prompt.
+
+        Mirrors what the text agent sees (SOUL.md + memory snapshots) so the
+        voice layer knows who it is, who it talks to and where it is.
+        """
+        parts: List[str] = []
+        try:
+            from agent.prompt_builder import load_soul_md
+            soul = load_soul_md()
+            if soul:
+                parts.append(soul)
+        except Exception as e:
+            logger.debug("Realtime voice: could not load SOUL.md: %s", e)
+        try:
+            from tools.memory_tool import MemoryStore
+            store = MemoryStore()
+            store.load_from_disk()
+            for target in ("user", "memory"):
+                block = store.format_for_system_prompt(target)
+                if block:
+                    parts.append(block)
+        except Exception as e:
+            logger.debug("Realtime voice: could not load memory: %s", e)
+
+        where = []
+        try:
+            import hermes_time
+            where.append(f"Current time: {hermes_time.now():%Y-%m-%d %H:%M %Z}")
+        except Exception:
+            pass
+        channel = getattr(vc, "channel", None)
+        if channel is not None:
+            guild_name = getattr(getattr(channel, "guild", None), "name", "")
+            where.append(f"You are in the Discord voice channel '{channel.name}' on the server '{guild_name}'.")
+        text_ch_id = self._voice_text_channels.get(guild_id)
+        text_ch = self._client.get_channel(text_ch_id) if (self._client and text_ch_id) else None
+        if text_ch is not None and getattr(text_ch, "name", None):
+            where.append(f"Your ask_hermes requests and replies are logged in the text channel #{text_ch.name}.")
+        if where:
+            parts.append("\n".join(where))
+        return "\n\n".join(parts)
 
     async def _realtime_voice_loop(self, guild_id: int, bridge) -> None:
         """Stream the invoking user's audio into the Realtime session.
