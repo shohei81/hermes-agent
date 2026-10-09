@@ -325,6 +325,9 @@ class TestRealtimeDelegate:
         assert event.source.chat_id == "123"
         assert event.raw_message.guild_id == 111
         adapter.send.assert_awaited_once_with("123", "予定は3件です")
+        logged = adapter._client.get_channel.return_value.send.call_args[0][0]
+        assert logged == "**[Voice → Hermes]** 今日の予定は？"
+        assert "<@" not in logged
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_is_refused(self, tmp_path):

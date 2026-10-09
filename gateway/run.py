@@ -18975,7 +18975,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         safe_task = task[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
         try:
             if channel:
-                await channel.send(f"**[Voice → Hermes]** <@{user_id}>: {safe_task}")
+                # No <@user> mention: this is a log line, not a ping.
+                await channel.send(f"**[Voice → Hermes]** {safe_task}")
         except Exception:
             pass
 
