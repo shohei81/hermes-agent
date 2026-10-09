@@ -18962,7 +18962,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         prompt = (
             "[Voice call] The user asked this by voice through your realtime voice "
-            "layer; your reply will be spoken back to them, so keep it concise. "
+            "layer. Open your reply with a 1-2 sentence plain-speech summary (no "
+            "markdown, lists or URLs) that can be read aloud; put any details after "
+            "it, since the full reply is posted to the text channel. "
             "Act on it directly: read whatever Discord channels, files or web pages "
             "you need without asking for confirmation (read-only actions need no "
             "approval).\n\n" + task
