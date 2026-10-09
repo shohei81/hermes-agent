@@ -1368,6 +1368,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                try:
+                    await adapter_self._follow_voice_state(member, before, after)
+                except Exception as e:
+                    logger.warning("Voice follow failed: %s", e, exc_info=True)
                 # Only track channels where the bot is connected
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -4634,6 +4638,73 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._on_voice_disconnect(str(text_ch_id))
                 except Exception:
                     pass
+
+    def _load_voice_follow_config(self) -> Dict[str, Any]:
+        """Read ``discord.voice_follow`` from config.yaml (off by default)."""
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "user_id": "",          # "" = the single DISCORD_ALLOWED_USERS entry
+            "text_channel_id": "",  # "" = DISCORD_HOME_CHANNEL
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            vf = ((cfg.get("discord") or {}).get("voice_follow") or {})
+            if isinstance(vf, dict):
+                for k, v in vf.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_follow config: %s", e)
+        return defaults
+
+    def _voice_follow_target(self) -> Optional[tuple]:
+        """Return (user_id, text_channel_id) to follow, or None when disabled."""
+        cfg = self._load_voice_follow_config()
+        if not cfg.get("enabled"):
+            return None
+        user_id = str(cfg.get("user_id") or "").strip()
+        if not user_id:
+            allowed = [u for u in getattr(self, "_allowed_user_ids", set()) if str(u).isdigit()]
+            user_id = str(allowed[0]) if len(allowed) == 1 else ""
+        text_ch = str(cfg.get("text_channel_id") or os.getenv("DISCORD_HOME_CHANNEL", "")).strip()
+        if not (user_id.isdigit() and text_ch.isdigit()):
+            logger.warning(
+                "discord.voice_follow enabled but user_id/text_channel_id could not be resolved "
+                "(set them explicitly, or use a single DISCORD_ALLOWED_USERS entry and DISCORD_HOME_CHANNEL)"
+            )
+            return None
+        return int(user_id), int(text_ch)
+
+    async def _follow_voice_state(self, member, before, after) -> None:
+        """Join, move or leave voice together with the followed user."""
+        target = self._voice_follow_target()
+        if not target or member.id != target[0]:
+            return
+        _, text_ch_id = target
+        guild_id = member.guild.id
+        if after.channel is None:
+            if guild_id in self._voice_clients:
+                await self.leave_voice_channel(guild_id)
+                if self._on_voice_disconnect:
+                    try:
+                        self._on_voice_disconnect(str(text_ch_id))
+                    except Exception:
+                        pass
+            return
+        if before.channel == after.channel:
+            return  # mute/deafen/stream toggles
+        text_channel = self._client.get_channel(text_ch_id) if self._client else None
+        is_dm = DISCORD_AVAILABLE and isinstance(text_channel, discord.DMChannel)
+        source = self.build_source(
+            chat_id=str(text_ch_id),
+            chat_name="" if is_dm else getattr(text_channel, "name", ""),
+            chat_type="dm" if is_dm else "group",
+            user_id=str(member.id),
+            user_name=member.display_name,
+        )
+        logger.info("Following user %d into voice channel %s", member.id, after.channel.name)
+        await self.join_voice_channel(after.channel, text_channel_id=text_ch_id, source=source.to_dict())
 
     def realtime_voice_active_for_chat(self, chat_id: str) -> bool:
         """True when a Realtime voice session is bound to this text channel."""

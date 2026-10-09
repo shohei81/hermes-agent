@@ -352,3 +352,80 @@ class TestRealtimeDelegate:
             source=SessionSource(platform=Platform.DISCORD, chat_id="123", user_id="42"),
         )
         assert runner._should_send_voice_reply(event, "hello", []) is False
+
+
+# =====================================================================
+# Voice follow (discord.voice_follow)
+# =====================================================================
+
+class TestVoiceFollow:
+    def _make_adapter(self, monkeypatch, cfg=None):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        adapter = object.__new__(DiscordAdapter)
+        adapter._allowed_user_ids = {"42"}
+        adapter._voice_clients = {}
+        adapter._on_voice_disconnect = MagicMock()
+        adapter._client = MagicMock()
+        adapter._client.get_channel = MagicMock(return_value=SimpleNamespace(name="home"))
+        adapter.build_source = MagicMock(return_value=SimpleNamespace(to_dict=lambda: {"user_id": "42"}))
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter.leave_voice_channel = AsyncMock()
+        merged = {"enabled": True, "user_id": "", "text_channel_id": ""}
+        merged.update(cfg or {})
+        adapter._load_voice_follow_config = lambda: merged
+        monkeypatch.setenv("DISCORD_HOME_CHANNEL", "123")
+        return adapter
+
+    @staticmethod
+    def _member(user_id=42, guild_id=111):
+        return SimpleNamespace(id=user_id, display_name="me", guild=SimpleNamespace(id=guild_id))
+
+    @staticmethod
+    def _state(channel):
+        return SimpleNamespace(channel=channel)
+
+    def test_target_defaults_to_single_allowed_user_and_home_channel(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        assert adapter._voice_follow_target() == (42, 123)
+
+    def test_target_none_when_disabled(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch, {"enabled": False})
+        assert adapter._voice_follow_target() is None
+
+    def test_target_none_when_user_ambiguous(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        adapter._allowed_user_ids = {"42", "43"}
+        assert adapter._voice_follow_target() is None
+
+    @pytest.mark.asyncio
+    async def test_joins_when_followed_user_enters(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        vc_channel = SimpleNamespace(name="General")
+        await adapter._follow_voice_state(self._member(), self._state(None), self._state(vc_channel))
+        adapter.join_voice_channel.assert_awaited_once_with(
+            vc_channel, text_channel_id=123, source={"user_id": "42"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_moves_when_followed_user_switches(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        a, b = SimpleNamespace(name="A"), SimpleNamespace(name="B")
+        await adapter._follow_voice_state(self._member(), self._state(a), self._state(b))
+        assert adapter.join_voice_channel.call_args[0][0] is b
+
+    @pytest.mark.asyncio
+    async def test_leaves_when_followed_user_leaves(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        adapter._voice_clients[111] = MagicMock()
+        await adapter._follow_voice_state(self._member(), self._state(SimpleNamespace(name="A")), self._state(None))
+        adapter.leave_voice_channel.assert_awaited_once_with(111)
+        adapter._on_voice_disconnect.assert_called_once_with("123")
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_users_and_mute_toggles(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        ch = SimpleNamespace(name="A")
+        await adapter._follow_voice_state(self._member(user_id=99), self._state(None), self._state(ch))
+        await adapter._follow_voice_state(self._member(), self._state(ch), self._state(ch))
+        adapter.join_voice_channel.assert_not_called()
+        adapter.leave_voice_channel.assert_not_called()
