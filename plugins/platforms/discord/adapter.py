@@ -4613,6 +4613,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 task=task,
             )
 
+        await self._open_voice_thread(guild_id)
         bridge = bridge_cls(
             api_key=api_key,
             delegate=_delegate,
@@ -4630,6 +4631,38 @@ class DiscordAdapter(BasePlatformAdapter):
             self._realtime_voice_loop(guild_id, bridge)
         )
         return True
+
+    async def _open_voice_thread(self, guild_id: int) -> None:
+        """Give this call its own thread (and Hermes session) in the bound text channel.
+
+        Delegations then start from a short history instead of the channel's
+        long-running session, which keeps every backend turn small and fast.
+        """
+        text_ch_id = self._voice_text_channels.get(guild_id)
+        channel = self._client.get_channel(text_ch_id) if (self._client and text_ch_id) else None
+        if channel is None or not hasattr(channel, "create_thread"):
+            return  # DMs and threads cannot hold a new thread
+        try:
+            import hermes_time
+            thread = await channel.create_thread(
+                name=f"Voice — {hermes_time.now():%m/%d %H:%M}",
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440,
+            )
+        except Exception as e:
+            logger.warning("Could not open a voice thread in %s: %s", text_ch_id, e)
+            return
+        source = self._voice_sources.get(guild_id)
+        if source:
+            self._voice_sources[guild_id] = {
+                **source,
+                "chat_id": str(thread.id),
+                "chat_name": thread.name,
+                "chat_type": "thread",
+                "thread_id": str(thread.id),
+                "parent_chat_id": str(text_ch_id),
+            }
+        self._voice_text_channels[guild_id] = thread.id
 
     def _realtime_voice_context(self, guild_id: int, vc) -> str:
         """Identity, memory and whereabouts for the Realtime voice prompt.

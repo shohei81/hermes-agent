@@ -195,6 +195,8 @@ class TestAdapterPicksLiveBridge:
         adapter._voice_sources = {}
         adapter._voice_realtime_bridges = {}
         adapter._voice_listen_tasks = {}
+        adapter._voice_text_channels = {}
+        adapter._client = None
         adapter._load_voice_realtime_config = lambda: {
             "enabled": True, "model": "gpt-live-1", "voice": "marin", "instructions": "",
         }
@@ -212,3 +214,51 @@ class TestAdapterPicksLiveBridge:
         assert await adapter._start_realtime_voice(111, vc) is True
         assert started == ["LiveVoiceBridge"]
         vc.play.assert_called_once_with(adapter._voice_realtime_bridges[111].source)
+
+
+class TestVoiceThread:
+    def _adapter(self, channel):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        adapter._voice_text_channels = {111: 123}
+        adapter._voice_sources = {111: {"platform": "discord", "chat_id": "123", "chat_type": "group", "user_id": "9"}}
+        adapter._client = MagicMock()
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_call_gets_its_own_thread_session(self):
+        from types import SimpleNamespace
+
+        channel = MagicMock()
+        channel.create_thread = AsyncMock(return_value=SimpleNamespace(id=456, name="Voice — 10/13 15:00"))
+        adapter = self._adapter(channel)
+
+        await adapter._open_voice_thread(111)
+
+        assert channel.create_thread.await_args.kwargs["name"].startswith("Voice — ")
+        assert adapter._voice_text_channels[111] == 456
+        assert adapter._voice_sources[111] == {
+            "platform": "discord", "chat_id": "456", "chat_name": "Voice — 10/13 15:00",
+            "chat_type": "thread", "user_id": "9", "thread_id": "456", "parent_chat_id": "123",
+        }
+
+    @pytest.mark.asyncio
+    async def test_thread_failure_keeps_text_channel(self):
+        channel = MagicMock()
+        channel.create_thread = AsyncMock(side_effect=RuntimeError("missing permissions"))
+        adapter = self._adapter(channel)
+
+        await adapter._open_voice_thread(111)
+
+        assert adapter._voice_text_channels[111] == 123
+        assert adapter._voice_sources[111]["chat_id"] == "123"
+
+    @pytest.mark.asyncio
+    async def test_channels_without_threads_are_left_alone(self):
+        adapter = self._adapter(object())  # e.g. a DM channel
+
+        await adapter._open_voice_thread(111)
+
+        assert adapter._voice_text_channels[111] == 123
