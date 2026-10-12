@@ -4593,10 +4593,16 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return False
         try:
+            from live_voice import LiveVoiceBridge
             from realtime_voice import RealtimeVoiceBridge
         except ImportError:
+            from .live_voice import LiveVoiceBridge
             from .realtime_voice import RealtimeVoiceBridge
 
+        cfg = self._load_voice_realtime_config()
+        # gpt-live-* models are full-duplex and use client delegation instead
+        # of Realtime function calls.
+        bridge_cls = LiveVoiceBridge if str(cfg["model"]).startswith("gpt-live") else RealtimeVoiceBridge
         delegate_cb = self._voice_delegate_callback
 
         async def _delegate(task: str) -> str:
@@ -4607,8 +4613,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 task=task,
             )
 
-        cfg = self._load_voice_realtime_config()
-        bridge = RealtimeVoiceBridge(
+        bridge = bridge_cls(
             api_key=api_key,
             delegate=_delegate,
             model=str(cfg["model"]),
@@ -4664,11 +4669,11 @@ class DiscordAdapter(BasePlatformAdapter):
             text_channels = [c for c in getattr(guild, "text_channels", []) or [] if getattr(c, "name", None)]
             if text_channels:
                 listing = ", ".join(f"#{c.name} ({c.id})" for c in text_channels)
-                where.append(f"Text channels on this server that ask_hermes can read: {listing}.")
+                where.append(f"Text channels on this server that your backend (Hermes) can read: {listing}.")
         text_ch_id = self._voice_text_channels.get(guild_id)
         text_ch = self._client.get_channel(text_ch_id) if (self._client and text_ch_id) else None
         if text_ch is not None and getattr(text_ch, "name", None):
-            where.append(f"Your ask_hermes requests and replies are logged in the text channel #{text_ch.name}.")
+            where.append(f"Your requests to the backend and its replies are logged in the text channel #{text_ch.name}.")
         if where:
             parts.append("\n".join(where))
         return "\n\n".join(parts)
