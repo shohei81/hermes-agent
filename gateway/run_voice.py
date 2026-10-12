@@ -55,6 +55,9 @@ class GatewayVoiceMixin:
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
+        if hasattr(adapter, "_voice_delegate_callback"):
+            adapter._voice_delegate_callback = functools.partial(
+                self._handle_voice_realtime_delegate, adapter=adapter)
 
     def _load_voice_modes(self) -> dict[str, str]:
         try:
@@ -354,6 +357,62 @@ class GatewayVoiceMixin:
             channel_prompt=channel_prompt, auto_skill=auto_skill)
         await adapter.handle_message(event)
 
+    async def _handle_voice_realtime_delegate(
+        self, guild_id: int, user_id: int, task: str, *, adapter=None
+    ) -> str:
+        """Run a task handed over by the Realtime / GPT-Live voice layer.
+
+        The task goes through the normal agent pipeline in the bound text channel's session and
+        the reply text is returned for the voice model to speak. Task and reply are mirrored to
+        the text channel.
+        """
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
+        if not text_ch_id:
+            return "Hermes is not linked to a text channel for this voice session."
+        source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
+        from gateway.session_identity import clear_identity
+        clear_identity(source)
+        if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
+            return "This voice session is routed to a profile this gateway does not serve."
+        if not self._is_user_authorized_for_source(source):
+            logger.debug("Unauthorized realtime voice delegation from user %d, ignoring", user_id)
+            return "This user is not authorized to use Hermes."
+
+        channel = adapter._client.get_channel(text_ch_id) if adapter._client else None
+        safe_task = task[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        with suppress(Exception):
+            if channel:
+                # No <@user> mention: this is a log line, not a ping.
+                await channel.send(f"**[Voice → Hermes]** {safe_task}")
+
+        channel_prompt = None
+        if callable(resolver := getattr(adapter, "_resolve_channel_prompt", None)):
+            with suppress(Exception):
+                resolved = resolver(str(text_ch_id), source.parent_chat_id or None)
+                channel_prompt = resolved if isinstance(resolved, str) else None
+        prompt = (
+            "[Voice call] The user asked this by voice through your realtime voice "
+            "layer. Open your reply with a 1-2 sentence plain-speech summary (no "
+            "markdown, lists or URLs) that can be read aloud; put any details after "
+            "it, since the full reply is posted to the text channel. "
+            "Act on it directly: read whatever Discord channels, files or web pages "
+            "you need without asking for confirmation (read-only actions need no "
+            "approval).\n\n" + task
+        )
+        event = MessageEvent(
+            source=source, text=prompt, message_type=MessageType.TEXT,
+            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            channel_prompt=channel_prompt)
+        response = await self._handle_message(event) or ""
+        if response:
+            try:
+                await adapter.send(str(text_ch_id), response)
+            except Exception:
+                logger.debug("Failed to mirror realtime delegation reply", exc_info=True)
+        return response
+
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False
     ) -> bool:
@@ -370,6 +429,10 @@ class GatewayVoiceMixin:
         if getattr(event.source.platform, "value", None) == "a2a":
             return False
         chat_id = event.source.chat_id
+        # A Realtime voice session speaks for itself; never layer TTS over it.
+        _rt_adapter = self._delivery_adapter_for(event.source)
+        if getattr(_rt_adapter, "realtime_voice_active_for_chat", lambda _c: False)(chat_id) is True:
+            return False
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
         is_voice_input = event.message_type == MessageType.VOICE
         adapter = self._delivery_adapter_for(event.source)
